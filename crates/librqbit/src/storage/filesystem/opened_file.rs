@@ -179,7 +179,14 @@ impl OpenedFile {
         if !g.tried_marking_sparse {
             g.tried_marking_sparse = true;
             let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
-            tracing::debug!(path=?g.path, marked=super::sparse::mark_file_sparse(f), "marking sparse");
+            // Not inside the log macro: tracing evaluates fields only when
+            // the event is enabled, and the default level is info.
+            if super::sparse::mark_file_sparse(f) {
+                tracing::debug!(path=?g.path, "marked sparse");
+            } else {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(path=?g.path, ?err, "could not mark file sparse; writes past EOF will allocate the gap");
+            }
         }
         let g = parking_lot::RwLockWriteGuard::downgrade(g);
         Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
@@ -195,6 +202,30 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::storage::filesystem::opened_file::OurFileExt;
+
+    /// The shipped binary logs at info: marking must not depend on a debug
+    /// event being enabled.
+    #[cfg(windows)]
+    #[test]
+    fn marks_file_sparse_without_a_tracing_subscriber() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        let td = TempDir::with_prefix("sparse").unwrap();
+        let path = td.path().join("f");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let of = super::OpenedFile::new(path.clone(), file);
+        of.try_mark_sparse().unwrap().pwrite_all(1 << 30, &[1u8; 8]).unwrap();
+        let attrs = std::fs::metadata(&path).unwrap().file_attributes();
+        assert!(
+            attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0,
+            "file written at 1 GiB is not sparse: attrs={attrs:#x}"
+        );
+    }
 
     #[test]
     fn test_pwrite_all_vectored() {
