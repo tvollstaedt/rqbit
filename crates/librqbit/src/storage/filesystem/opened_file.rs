@@ -1,12 +1,17 @@
 use std::{
-    fs::File,
+    collections::VecDeque,
+    fs::{File, OpenOptions},
     io::IoSlice,
     ops::{Deref, DerefMut},
     path::PathBuf,
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::Context;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::Error;
 
@@ -99,97 +104,257 @@ impl OurFileExt for File {
     }
 }
 
-#[derive(Default, Debug)]
+/// Bounds the handles open across every storage in the process: `cap` at
+/// most, the oldest closed first. A torrent has one entry per file, and a
+/// 14,000-file torrent would otherwise hold 14,000 fds from `init` on.
+#[derive(Debug)]
+pub(crate) struct FilePool {
+    cap: usize,
+    open: AtomicUsize,
+    order: Mutex<VecDeque<Weak<OpenedFile>>>,
+}
+
+impl FilePool {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap: cap.max(1),
+            open: AtomicUsize::new(0),
+            order: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// One pool for the process, sized from the fd limit at first use: a
+    /// quarter of the soft limit, between 64 and 2,048. The rest is for
+    /// sockets, which burst to a few hundred when the torrents go live.
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: OnceLock<Arc<FilePool>> = OnceLock::new();
+        GLOBAL
+            .get_or_init(|| {
+                let soft = rlimit::getrlimit(rlimit::Resource::NOFILE)
+                    .map(|(soft, _)| soft)
+                    .unwrap_or(1024);
+                let cap = usize::try_from(soft / 4).unwrap_or(2048).clamp(64, 2048);
+                tracing::debug!(cap, soft, "file pool sized");
+                Self::new(cap)
+            })
+            .clone()
+    }
+
+    pub fn open_count(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// Close the oldest idle handles until one more fits. Busy handles go
+    /// back to the end of the queue; taken or dropped entries fall out.
+    fn make_room(&self) {
+        if self.open_count() < self.cap {
+            return;
+        }
+        let candidates: Vec<Weak<OpenedFile>> = {
+            let mut order = self.order.lock();
+            let n = (self.open_count() + 1 - self.cap + 8).min(order.len());
+            order.drain(..n).collect()
+        };
+        for weak in candidates {
+            let Some(of) = weak.upgrade() else { continue };
+            if (self.open_count() < self.cap || !of.try_close()) && of.is_open() {
+                self.order.lock().push_back(weak);
+            }
+        }
+    }
+
+    fn opened(&self, of: &Arc<OpenedFile>) {
+        self.open.fetch_add(1, Ordering::Relaxed);
+        self.order.lock().push_back(Arc::downgrade(of));
+    }
+
+    fn closed(&self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+enum Fd {
+    /// Known path, no handle: opened on first access.
+    Closed(PathBuf),
+    Open(PathBuf, File),
+    /// Moved out by `take_clone`, or a padding file: never opened again.
+    Taken,
+}
+
+impl Fd {
+    fn file(&self) -> Option<&File> {
+        match self {
+            Fd::Open(_, f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn file_mut(&mut self) -> Option<&mut File> {
+        match self {
+            Fd::Open(_, f) => Some(f),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn path(&self) -> Option<&PathBuf> {
+        match self {
+            Fd::Closed(p) | Fd::Open(p, _) => Some(p),
+            Fd::Taken => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct OpenedFileLocked {
-    #[allow(unused)]
-    path: PathBuf,
-    fd: Option<File>,
+    fd: Fd,
     #[cfg(windows)]
     tried_marking_sparse: bool,
-}
-
-impl Deref for OpenedFileLocked {
-    type Target = Option<File>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.fd
-    }
-}
-
-impl DerefMut for OpenedFileLocked {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.fd
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct OpenedFile {
     file: RwLock<OpenedFileLocked>,
+    pool: Arc<FilePool>,
 }
 
 impl OpenedFile {
-    pub fn new(path: PathBuf, f: File) -> Self {
+    /// An entry whose file exists on disk; the handle is opened on first use.
+    pub fn new_closed(path: PathBuf, pool: Arc<FilePool>) -> Self {
         Self {
             file: RwLock::new(OpenedFileLocked {
-                path,
-                fd: Some(f),
+                fd: Fd::Closed(path),
                 #[cfg(windows)]
                 tried_marking_sparse: false,
             }),
+            pool,
         }
     }
 
-    pub fn new_dummy() -> Self {
+    pub fn new_dummy(pool: Arc<FilePool>) -> Self {
         Self {
-            file: RwLock::new(Default::default()),
+            file: RwLock::new(OpenedFileLocked {
+                fd: Fd::Taken,
+                #[cfg(windows)]
+                tried_marking_sparse: false,
+            }),
+            pool,
         }
     }
 
     pub fn take_clone(&self) -> anyhow::Result<Self> {
-        let f = std::mem::take(&mut *self.file.write());
+        let mut g = self.file.write();
+        let fd = std::mem::replace(&mut g.fd, Fd::Taken);
         Ok(Self {
-            file: RwLock::new(f),
+            file: RwLock::new(OpenedFileLocked {
+                fd,
+                #[cfg(windows)]
+                tried_marking_sparse: g.tried_marking_sparse,
+            }),
+            pool: self.pool.clone(),
         })
     }
 
-    pub fn lock_read(&self) -> crate::Result<impl Deref<Target = File>> {
-        RwLockReadGuard::try_map(self.file.read(), |f| f.as_ref())
-            .ok()
-            .ok_or(Error::FsFileIsNone)
+    /// Close the handle unless someone is using it. `true` when closed.
+    pub fn try_close(&self) -> bool {
+        let Some(mut g) = self.file.try_write() else {
+            return false;
+        };
+        if let Fd::Open(path, _) = &g.fd {
+            let path = path.clone();
+            g.fd = Fd::Closed(path);
+            self.pool.closed();
+            return true;
+        }
+        false
     }
 
-    #[allow(dead_code)]
-    pub fn lock_write(&self) -> crate::Result<impl DerefMut<Target = File>> {
-        RwLockWriteGuard::try_map(self.file.write(), |f| f.as_mut())
-            .ok()
-            .ok_or(Error::FsFileIsNone)
+    pub fn is_open(&self) -> bool {
+        matches!(self.file.read().fd, Fd::Open(..))
     }
 
-    #[cfg(windows)]
-    pub fn try_mark_sparse(&self) -> crate::Result<impl Deref<Target = File>> {
+    /// Open the handle if it is closed. Under the write lock, so a reader
+    /// never sees a half-open entry and eviction cannot interleave.
+    fn open_locked(self: &Arc<Self>, g: &mut OpenedFileLocked) -> crate::Result<()> {
+        match &g.fd {
+            Fd::Open(..) => Ok(()),
+            Fd::Taken => Err(Error::FsFileIsNone),
+            Fd::Closed(path) => {
+                self.pool.make_room();
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .with_context(|| format!("error opening {path:?} in read/write mode"))
+                    .map_err(Error::Anyhow)?;
+                let path = path.clone();
+                g.fd = Fd::Open(path, f);
+                self.pool.opened(self);
+                Ok(())
+            }
+        }
+    }
+
+    /// The entry with its handle open, under the read lock.
+    fn ensure_open(self: &Arc<Self>) -> crate::Result<RwLockReadGuard<'_, OpenedFileLocked>> {
         {
             let g = self.file.read();
-            if g.tried_marking_sparse {
-                return RwLockReadGuard::try_map(g, |f| f.fd.as_ref())
-                    .ok()
-                    .ok_or(Error::FsFileIsNone);
+            match g.fd {
+                Fd::Open(..) => return Ok(g),
+                Fd::Taken => return Err(Error::FsFileIsNone),
+                Fd::Closed(_) => {}
             }
         }
         let mut g = self.file.write();
+        self.open_locked(&mut g)?;
+        Ok(RwLockWriteGuard::downgrade(g))
+    }
+
+    pub fn lock_read(self: &Arc<Self>) -> crate::Result<impl Deref<Target = File> + '_> {
+        let g = self.ensure_open()?;
+        Ok(RwLockReadGuard::map(g, |l| {
+            l.fd.file().expect("ensure_open leaves the fd open")
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub fn lock_write(self: &Arc<Self>) -> crate::Result<impl DerefMut<Target = File> + '_> {
+        let mut g = self.file.write();
+        self.open_locked(&mut g)?;
+        Ok(RwLockWriteGuard::map(g, |l| {
+            l.fd.file_mut().expect("open_locked leaves the fd open")
+        }))
+    }
+
+    #[cfg(windows)]
+    pub fn try_mark_sparse(self: &Arc<Self>) -> crate::Result<impl Deref<Target = File> + '_> {
+        {
+            let g = self.ensure_open()?;
+            if g.tried_marking_sparse {
+                return Ok(RwLockReadGuard::map(g, |l| {
+                    l.fd.file().expect("ensure_open leaves the fd open")
+                }));
+            }
+        }
+        let mut g = self.file.write();
+        self.open_locked(&mut g)?;
         if !g.tried_marking_sparse {
             g.tried_marking_sparse = true;
-            let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
+            let f = g.fd.file().expect("open_locked leaves the fd open");
             // Not inside the log macro: tracing evaluates fields only when
             // the event is enabled, and the default level is info.
             if super::sparse::mark_file_sparse(f) {
-                tracing::debug!(path=?g.path, "marked sparse");
+                tracing::debug!(path=?g.fd.path(), "marked sparse");
             } else {
                 let err = std::io::Error::last_os_error();
-                tracing::warn!(path=?g.path, ?err, "could not mark file sparse; writes past EOF will allocate the gap");
+                tracing::warn!(path=?g.fd.path(), ?err, "could not mark file sparse; writes past EOF will allocate the gap");
             }
         }
         let g = parking_lot::RwLockWriteGuard::downgrade(g);
-        Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
+        Ok(RwLockReadGuard::map(g, |l| {
+            l.fd.file().expect("open_locked leaves the fd open")
+        }))
     }
 }
 
@@ -212,14 +377,15 @@ mod tests {
         const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
         let td = TempDir::with_prefix("sparse").unwrap();
         let path = td.path().join("f");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
+        std::fs::File::create(&path).unwrap();
+        let of = std::sync::Arc::new(super::OpenedFile::new_closed(
+            path.clone(),
+            super::FilePool::new(4),
+        ));
+        of.try_mark_sparse()
+            .unwrap()
+            .pwrite_all(1 << 30, &[1u8; 8])
             .unwrap();
-        let of = super::OpenedFile::new(path.clone(), file);
-        of.try_mark_sparse().unwrap().pwrite_all(1 << 30, &[1u8; 8]).unwrap();
         let attrs = std::fs::metadata(&path).unwrap().file_attributes();
         assert!(
             attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0,
