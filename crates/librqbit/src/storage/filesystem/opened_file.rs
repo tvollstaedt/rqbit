@@ -130,9 +130,13 @@ impl FilePool {
         static GLOBAL: OnceLock<Arc<FilePool>> = OnceLock::new();
         GLOBAL
             .get_or_init(|| {
+                #[cfg(unix)]
                 let soft = rlimit::getrlimit(rlimit::Resource::NOFILE)
                     .map(|(soft, _)| soft)
                     .unwrap_or(1024);
+                // No descriptor limit on Windows; the pool still bounds the handles.
+                #[cfg(not(unix))]
+                let soft: u64 = 8192;
                 let cap = usize::try_from(soft / 4).unwrap_or(2048).clamp(64, 2048);
                 tracing::debug!(cap, soft, "file pool sized");
                 Self::new(cap)
