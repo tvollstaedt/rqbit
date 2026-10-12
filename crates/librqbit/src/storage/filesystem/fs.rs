@@ -290,4 +290,76 @@ mod tests {
         taken.pread_exact(1, 0, &mut buf).unwrap();
         assert_eq!(&buf, b"abcd");
     }
+
+    /// `take` hands over closed entries: the moved handles stay evictable
+    /// and the count follows the handles, so a later storage on the same
+    /// pool is not squeezed by handles nobody can close.
+    #[test]
+    fn taken_handles_stay_evictable_and_counted() {
+        let td = tempfile::TempDir::with_prefix("takecount").unwrap();
+        let s = storage_with_files(td.path(), 8, 8);
+        for i in 0..8 {
+            s.pwrite_all(i, 0, b"x").unwrap();
+        }
+        assert_eq!(s.pool.open_count(), 8);
+        let taken = s.take_fs().unwrap();
+        assert_eq!(s.pool.open_count(), 0, "take closes what it moves");
+        for i in 0..8 {
+            taken.pwrite_all(i, 0, b"y").unwrap();
+        }
+        let other_dir = td.path().join("o");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = FilesystemStorage {
+            opened_files: (0..32)
+                .map(|i| {
+                    let p = other_dir.join(format!("g{i}"));
+                    std::fs::File::create(&p).unwrap();
+                    Arc::new(OpenedFile::new_closed(p, s.pool.clone()))
+                })
+                .collect(),
+            output_folder: other_dir.clone(),
+            pool: s.pool.clone(),
+        };
+        for i in 0..32 {
+            other.pwrite_all(i, 0, b"z").unwrap();
+            assert!(s.pool.open_count() <= 8, "open={}", s.pool.open_count());
+        }
+        let open_in_taken = taken.opened_files.iter().filter(|f| f.is_open()).count();
+        assert_eq!(open_in_taken, 0, "the taken entries must have been evicted");
+        drop(taken);
+        drop(other);
+        assert_eq!(
+            s.pool.open_count(),
+            0,
+            "drop returns every handle to the count"
+        );
+    }
+
+    /// Sixteen threads racing random writes near the cap: no panic in
+    /// make_room's arithmetic, every write lands.
+    #[test]
+    fn concurrent_writes_stay_under_cap_without_panicking() {
+        let td = tempfile::TempDir::with_prefix("race").unwrap();
+        let s = Arc::new(storage_with_files(td.path(), 256, 4));
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for i in 0..400 {
+                        let file = (t * 37 + i * 11) % 256;
+                        s.pwrite_all(file, 0, &[u8::try_from(t).unwrap()]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("a writer panicked");
+        }
+        let open: usize = s.opened_files.iter().filter(|f| f.is_open()).count();
+        assert_eq!(
+            open,
+            s.pool.open_count(),
+            "count must match the open handles"
+        );
+    }
 }

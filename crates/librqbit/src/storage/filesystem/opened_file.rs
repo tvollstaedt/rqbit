@@ -156,7 +156,11 @@ impl FilePool {
         }
         let candidates: Vec<Weak<OpenedFile>> = {
             let mut order = self.order.lock();
-            let n = (self.open_count() + 1 - self.cap + 8).min(order.len());
+            // Saturating: a concurrent make_room may have closed handles
+            // between the check above and this read.
+            let n = (self.open_count() + 9)
+                .saturating_sub(self.cap)
+                .min(order.len());
             order.drain(..n).collect()
         };
         for weak in candidates {
@@ -223,6 +227,14 @@ pub(crate) struct OpenedFile {
     pool: Arc<FilePool>,
 }
 
+impl Drop for OpenedFile {
+    fn drop(&mut self) {
+        if matches!(self.file.get_mut().fd, Fd::Open(..)) {
+            self.pool.closed();
+        }
+    }
+}
+
 impl OpenedFile {
     /// An entry whose file exists on disk; the handle is opened on first use.
     pub fn new_closed(path: PathBuf, pool: Arc<FilePool>) -> Self {
@@ -247,9 +259,18 @@ impl OpenedFile {
         }
     }
 
+    /// The new entry starts closed: an open handle moved as-is would sit in
+    /// no eviction queue and count against the pool until the process ends.
     pub fn take_clone(&self) -> anyhow::Result<Self> {
         let mut g = self.file.write();
-        let fd = std::mem::replace(&mut g.fd, Fd::Taken);
+        let fd = match std::mem::replace(&mut g.fd, Fd::Taken) {
+            Fd::Open(path, file) => {
+                drop(file);
+                self.pool.closed();
+                Fd::Closed(path)
+            }
+            other => other,
+        };
         Ok(Self {
             file: RwLock::new(OpenedFileLocked {
                 fd,
